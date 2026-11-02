@@ -1,0 +1,95 @@
+# Vigilfield rule: https://vigilfield.com/docs/detect/rules#rules-as-code
+#
+# The core pack's sequence rule (ADR-0125 §8): an anomaly and a sensitive
+# action by the same user, host or service within an hour, from two rules.
+#
+# - An anomaly is a signal a model scored (`model` set), or one whose
+#   explanation compares a value with a baseline.
+# - A sensitive action is a signal whose tactic is one of persistence,
+#   privilege-escalation, defense-evasion, credential-access, exfiltration or
+#   impact. Edit the list to suit you.
+# - The hour is measured between the times the two signals were written, in
+#   either order: a rule over hourly feature rows writes its anomaly after the
+#   hour it describes, so often after the action's own signal.
+# - Each pair alerts once, when the later of its two signals arrives, and the
+#   alert's key is the entity, so pairs for one entity add to its open alert.
+# - It alerts and writes no signals, so it never pairs with itself.
+key: "core.anomaly-then-sensitive-action"
+name: "Anomaly, then a sensitive action"
+description: "One user, host or service did something unusual and a sensitive action within an hour, found by two different rules. Open the entity to see both signals. Check whether the person made the change, for example by asking them, before you resolve it."
+schedule: "*/5 * * * *"
+enabled: true
+alerting:
+  severity: "high"
+  integrations: []
+vfql_version: "2"
+query: |-
+  declare query_parameters (within: timespan = 1h);
+  // A day of signals, more than `within` on either side of a new one.
+  let anomalies = vf_signals
+      | where vf_event_timestamp > ago(1d)
+      | where not(isempty(model)) or tostring(explanation) contains '"entity_baseline"'
+          or tostring(explanation) contains '"population_baseline"'
+      | project entity_kind, entity, anomaly_rule = rule_id, anomaly_at = vf_event_timestamp;
+  let actions = vf_signals
+      | where vf_event_timestamp > ago(1d)
+      | where tactic in ('persistence', 'privilege-escalation', 'defense-evasion', 'credential-access', 'exfiltration', 'impact')
+      | project entity_kind, entity, action_rule = rule_id, action_at = vf_event_timestamp, action_tactic = tactic;
+  // The signals new since the last run; each pair must hold one of them.
+  vf_signals
+  | project entity_kind, entity, new_rule = rule_id, new_at = vf_event_timestamp
+  | join kind=inner (anomalies) on entity_kind, entity
+  | join kind=inner (actions) on entity_kind, entity
+  | where anomaly_rule != action_rule
+  | where (new_rule == anomaly_rule and new_at == anomaly_at) or (new_rule == action_rule and new_at == action_at)
+  | where (action_at - anomaly_at) / within <= 1.0 and (anomaly_at - action_at) / within <= 1.0
+  | summarize anomaly_at = max(anomaly_at), action_at = max(action_at), anomaly_rules = make_set(anomaly_rule),
+      action_rules = make_set(action_rule), tactics = make_set(action_tactic) by entity_kind, entity
+  | extend vf_alert_key = strcat(entity_kind, ':', entity),
+      vf_alert_title = strcat('Anomaly, then a sensitive action: ', entity),
+      vf_alert_description = strcat('An anomaly and a sensitive action by ', entity, ' within an hour, from two rules.')
+# The tests' signals are dated 2099, so they are always inside the last day.
+tests:
+  - name: "A model's anomaly then a persistence signal fires"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-model", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 60, tactic: "initial-access", model: "logins@3"}
+        - {vf_event_timestamp: "2099-01-01T00:30:00Z", rule_id: "rule-key", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 50, tactic: "persistence"}
+    expect:
+      fires: true
+      vf_alert_key: "user:alice@corp.com"
+  - name: "A baseline anomaly written after the action fires"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:50:00Z", rule_id: "rule-calls", run_id: "run-a", entity_kind: "service", entity: "arn:aws:iam::111122223333:role/deploy", score: 40, tactic: "discovery", explanation: {features: {calls: {value: 312, entity_baseline: {median: 20, p5: 2, p95: 40}}}}}
+        - {vf_event_timestamp: "2099-01-01T00:10:00Z", rule_id: "rule-trail", run_id: "run-b", entity_kind: "service", entity: "arn:aws:iam::111122223333:role/deploy", score: 70, tactic: "defense-evasion"}
+    expect:
+      fires: true
+      vf_alert_key: "service:arn:aws:iam::111122223333:role/deploy"
+  - name: "Two hours apart does not fire"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-model", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 60, model: "logins@3"}
+        - {vf_event_timestamp: "2099-01-01T02:00:00Z", rule_id: "rule-key", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 50, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "Two entities do not fire"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-model", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 60, model: "logins@3"}
+        - {vf_event_timestamp: "2099-01-01T00:30:00Z", rule_id: "rule-key", run_id: "run-b", entity_kind: "user", entity: "bob@corp.com", score: 50, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "A tactic that is not sensitive does not fire"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-model", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 60, model: "logins@3"}
+        - {vf_event_timestamp: "2099-01-01T00:30:00Z", rule_id: "rule-list", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 50, tactic: "discovery"}
+    expect:
+      fires: false
+  - name: "One rule's own anomaly and action do not fire"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-model", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 60, tactic: "persistence", model: "logins@3"}
+    expect:
+      fires: false

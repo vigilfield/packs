@@ -1,0 +1,283 @@
+# Vigilfield rule: https://vigilfield.com/docs/detect/rules#rules-as-code
+#
+# The core pack's risk rule (ADR-0125 §4, §8). Every 5 minutes it adds up the
+# recent signals about each user, host or service, and pages when they span
+# three or more ATT&CK tactics or pass a high total.
+#
+# - Each rule counts once per entity: its strongest signal in the window,
+#   halving every `half_life`. So a retried run, an overlapping window and a
+#   count that grows within its window all count once.
+# - A signal with no tactic counts as the tactic `untagged`.
+# - An `expected` verdict on an alert zeroes the signals with the same entity,
+#   rule and feature value that are written before it ends. A text value with
+#   a `\` or `"` in it never matches: it is read from the explanation's JSON
+#   text, where those are escaped, and VFQL has no function to undo that.
+# - Each `false_positive` verdict on a rule's alerts in the last 30 days
+#   lowers that rule's weight by `false_positive_step`.
+# - It writes no signals itself, so its pages never add to risk.
+# - Its final `where` is the paging condition, so the rows before it are every
+#   entity with its risk.
+#
+# The parameters are the defaults below; change them in `query` to tune it.
+key: "core.risk"
+name: "Entity risk"
+description: "Signals about one user, host or service span three or more ATT&CK tactics, or add up to a high risk, over the last 7 days. Each rule counts once, at its strongest signal, halving every 3 days. Open the entity to see its signals. An expected-activity verdict on a signal's alert stops that signal counting."
+schedule: "*/5 * * * *"
+enabled: true
+alerting:
+  severity: "high"
+  integrations: []
+vfql_version: "2"
+query: |-
+  declare query_parameters (risk_window: timespan = 7d, half_life: timespan = 3d, min_tactics: long = 3, high_total: real = 150.0, false_positive_step: real = 0.25);
+  // Each alert's current verdict: the latest change to it. Sixty days covers
+  // a 30-day expected verdict over a window of up to 30 days.
+  let judged = vf_alert_events
+      | where vf_event_timestamp > ago(60d)
+      | summarize judged_at = max(vf_event_timestamp),
+          verdict = arg_max(vf_event_timestamp, verdict),
+          alert_rule = arg_max(vf_event_timestamp, rule_id),
+          target_rule_id = arg_max(vf_event_timestamp, target_rule_id),
+          target_entity_kind = arg_max(vf_event_timestamp, target_entity_kind),
+          target_entity = arg_max(vf_event_timestamp, target_entity),
+          target_feature = arg_max(vf_event_timestamp, target_feature),
+          target_value = arg_max(vf_event_timestamp, target_value),
+          period_days = arg_max(vf_event_timestamp, period_days)
+          by alert_id;
+  // Expected activity, by the entity and rule it judged.
+  let expected = judged
+      | where verdict == 'expected' and not(isempty(target_feature))
+      | project judged_key = strcat(target_entity_kind, '|', target_entity, '|', target_rule_id),
+          feature = target_feature, judged_value = target_value, judged_at, period_days;
+  // False positives per rule in the last 30 days.
+  let misfires = judged
+      | where verdict == 'false_positive' and judged_at > ago(30d)
+      | extend rule_id = coalesce(target_rule_id, alert_rule)
+      | summarize false_positives = count() by rule_id;
+  // The entities with a new signal since the last run, with all their
+  // signals in the window.
+  vf_signals
+  | distinct entity_kind, entity
+  | join kind=inner (vf_signals | where vf_event_timestamp > ago(risk_window)) on entity_kind, entity
+  | extend judged_key = strcat(entity_kind, '|', entity, '|', rule_id)
+  | join kind=leftouter (expected) on judged_key
+  // The judged feature's value in the signal's explanation, as written there.
+  // A feature name with other characters becomes a newline, which compact
+  // JSON never holds, so it matches nothing and cannot break the pattern.
+  | extend raw_value = extract(strcat('"', iff(feature matches regex @'^[A-Za-z0-9_.-]+$', feature, @'\n'),
+      @'":\{.*?"value":("(?:[^"\\]|\\.)*"|[^,}\]]*)'), 1, tostring(explanation)),
+      judged_is_number = judged_value matches regex @'^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$'
+  | extend text_value = extract(@'^"(.*)"$', 1, raw_value),
+      number_value = extract(@'^(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)$', 1, raw_value),
+      judged_number = todouble(iff(judged_is_number, judged_value, '0'))
+  // A verdict stores a number at two decimals, so a number matches within
+  // half a hundredth. Only text a pattern has checked is read as a number.
+  | extend same_value = case(
+      not(isempty(text_value)), text_value == judged_value,
+      not(isempty(number_value)) and judged_is_number,
+        todouble(number_value) - judged_number <= 0.005 and judged_number - todouble(number_value) <= 0.005,
+      raw_value == judged_value)
+  | extend suppressed = iff(same_value and (vf_event_timestamp - judged_at) / 1d < period_days, 1, 0)
+  // One row per signal again; a repeated delivery is one signal.
+  | summarize suppressed = max(suppressed) by entity_kind, entity, rule_id, run_id, vf_event_timestamp, score, tactic
+  | join kind=leftouter (misfires) on rule_id
+  | extend weight = iff(isnull(false_positives), 1.0,
+      iff(false_positive_step * false_positives < 1.0, 1.0 - false_positive_step * false_positives, 0.0))
+  | extend counted = iff(suppressed == 1, 0.0, weight),
+      lowered = iff(weight < 1.0, 1, 0),
+      age = iff(now() > vf_event_timestamp, (now() - vf_event_timestamp) / half_life, 0.0)
+  | extend points = coalesce(score, 0.0) * pow(0.5, age) * counted,
+      tactic = iff(isempty(tactic), 'untagged', tactic)
+  // Each rule once per entity, at its strongest signal, under that signal's
+  // tactic. Between equally strong signals it takes one that counts, then the
+  // first tactic by name, so two runs over the same signals always agree.
+  | summarize points = max(points), counted = max(counted), lowered = max(lowered)
+      by entity_kind, entity, rule_id, tactic
+  | serialize by entity_kind asc, entity asc, rule_id asc, points desc, counted desc, tactic asc
+  | extend strongest = isnull(prev(rule_id)) or prev(rule_id) != rule_id or prev(entity) != entity
+      or prev(entity_kind) != entity_kind
+  | summarize points = max(points), counted = max(counted), lowered = max(lowered),
+      tactic = max(iff(strongest, tactic, '')) by entity_kind, entity, rule_id
+  | where counted > 0.0
+  | summarize points = sum(points), rules = count(), lowered = sum(lowered) by entity_kind, entity, tactic
+  | summarize risk = sum(points), tactics = count(), rules = sum(rules), lowered = sum(lowered),
+      tactic_list = make_set(tactic) by entity_kind, entity
+  | extend vf_alert_key = strcat(entity_kind, ':', entity),
+      vf_alert_title = strcat('High risk: ', entity),
+      vf_alert_description = strcat('Risk ', tostring(tolong(risk)), ' from ', tostring(rules), ' rules across ',
+        tostring(tactics), ' tactics.',
+        iff(lowered > 0, strcat(' ', tostring(lowered), ' of the rules count for less after false-positive verdicts.'), ''))
+  | where tactics >= min_tactics or risk >= high_total
+# The tests' signals are dated 2099, so none has aged: a signal dated after
+# now counts at full score. Risk is 30 a signal unless a test says otherwise,
+# so three tactics page well below the high total of 150.
+tests:
+  - name: "Three tactics page"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: true
+      vf_alert_key: "user:alice@corp.com"
+  - name: "Two tactics and a low total do not page"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "Three tactics across two entities do not page"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "bob@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: false
+  - name: "A high total pages"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 90, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "host", entity: "web-1", score: 70, tactic: "persistence"}
+    expect:
+      fires: true
+      vf_alert_key: "host:web-1"
+  - name: "A duplicate delivery counts once"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 80, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 80, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "An overlapping window counts once"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 80, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:05:00Z", rule_id: "rule-a", run_id: "run-b", entity_kind: "host", entity: "web-1", score: 80, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "A count that grows counts once, at its highest"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 40, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:05:00Z", rule_id: "rule-a", run_id: "run-b", entity_kind: "host", entity: "web-1", score: 60, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:10:00Z", rule_id: "rule-a", run_id: "run-c", entity_kind: "host", entity: "web-1", score: 80, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:10:00Z", rule_id: "rule-b", run_id: "run-d", entity_kind: "host", entity: "web-1", score: 60, tactic: "persistence"}
+    expect:
+      fires: false
+  - name: "One rule with three tactics counts one"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:05:00Z", rule_id: "rule-a", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 20, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:10:00Z", rule_id: "rule-a", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 10, tactic: "discovery"}
+    expect:
+      fires: false
+  - name: "Signals older than the window do not count"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2020-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2020-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2020-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: false
+  - name: "A signal with no tactic counts as untagged"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: true
+  - name: "Untagged is one tactic, however it is left out"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: ""}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: false
+  - name: "An expected verdict zeroes the signal it judged"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {country: {value: "NZ"}, hour: {value: 3}}}}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com", target_feature: "country", target_value: "NZ", period_days: 7}
+    expect:
+      fires: false
+  - name: "An expected verdict on another value leaves the signal counting"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {country: {value: "NZ"}}}}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com", target_feature: "country", target_value: "BR", period_days: 7}
+    expect:
+      fires: true
+  - name: "An expected verdict on another entity leaves the signal counting"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {country: {value: "NZ"}}}}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "bob@corp.com", target_feature: "country", target_value: "NZ", period_days: 7}
+    expect:
+      fires: true
+  - name: "A number matches the verdict's two-decimal form"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {calls: {entity_baseline: {median: 20, p5: 2, p95: 40}, value: 312.4567}}}}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com", target_feature: "calls", target_value: "312.46", period_days: 7}
+    expect:
+      fires: false
+  - name: "A signal written after an expected verdict ends counts"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-03T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {country: {value: "NZ"}}}}
+        - {vf_event_timestamp: "2099-01-03T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-03T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com", target_feature: "country", target_value: "NZ", period_days: 1}
+    expect:
+      fires: true
+  - name: "A changed verdict lifts the suppression"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access", explanation: {features: {country: {value: "NZ"}}}}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "expected", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com", target_feature: "country", target_value: "NZ", period_days: 7}
+        - {vf_event_timestamp: "2099-01-01T02:00:00Z", event: "verdict_set", alert_id: "alert-1", rule_id: "rule-a", verdict: "true_positive", target_rule_id: "rule-a", target_entity_kind: "user", target_entity: "alice@corp.com"}
+    expect:
+      fires: true
+  - name: "A false-positive verdict lowers its rule's weight"
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "host", entity: "web-1", score: 90, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-b", entity_kind: "host", entity: "web-1", score: 70, tactic: "persistence"}
+      vf_alert_events:
+        - {vf_event_timestamp: "2099-01-01T01:00:00Z", event: "resolved", alert_id: "alert-1", rule_id: "rule-a", verdict: "false_positive"}
+    expect:
+      fires: false
+  - name: "Equally strong signals take the first tactic by name"
+    # Rule a's two signals tie at 30 under persistence and initial-access, so
+    # its tactic is initial-access, the same as rule b's: two tactics, no
+    # page. Picking persistence would make three and page.
+    rows:
+      vf_signals:
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-a", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "persistence"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-a", run_id: "run-b", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-b", run_id: "run-c", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "initial-access"}
+        - {vf_event_timestamp: "2099-01-01T00:00:00Z", rule_id: "rule-c", run_id: "run-d", entity_kind: "user", entity: "alice@corp.com", score: 30, tactic: "discovery"}
+    expect:
+      fires: false
